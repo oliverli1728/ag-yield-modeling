@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Lasso
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.metrics import mean_squared_error
@@ -76,7 +76,7 @@ def get_data(crop, week, start_yr=2000, end_yr=2023, var_arr=[]):
         states = ["WASHINGTON", "SOUTH DAKOTA", "OKLAHOMA", "NEBRASKA", "MONTANA", "MISSOURI", "KANSAS", "ILLINOIS", "IDAHO", "COLORADO"]
 
 
-    df = get_ndvi("v15", "USDA-NASS-CDL_2018-2023_soybean-50pp", 1, 12)
+    df = get_ndvi("v15", "USDA-NASS-CDL_2018-2023_corn-50pp", 1, 12)
     
     idx = list()
     for i in range(end_yr - start_yr + 1):
@@ -156,7 +156,7 @@ def get_data(crop, week, start_yr=2000, end_yr=2023, var_arr=[]):
 
 # Takes "CORN" or "WHEAT, WINTER". Harvest weeks are 34/35/36 and 31, respectively. 
 # Overlay variable, either "harvested" or "maturity"
-y, x = get_data("SOYBEANS", 43, 2000, 2023, [1, 1, 1, 1, 1, 1, 1, 1])
+y, x = get_data("CORN", 31, 2000, 2023, [1, 1, 1, 1, 1, 1, 1, 1])
 
 vhi_links = ["https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=14&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
              "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=15&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
@@ -223,7 +223,7 @@ Hybrid model of ridge on training data and gradient boosted regressor on residua
 Will need to change params/models if using different framework.
 """
 
-def get_best_model(X, y, kwargs=None, ridge=True):
+def get_best_model(X, y, kwargs=None, lasso=True):
     xgb_params = {
     "learning_rate": np.arange(0.01, 0.2, 0.01),
     "gamma": np.arange(1, 5, 0.2),
@@ -233,20 +233,19 @@ def get_best_model(X, y, kwargs=None, ridge=True):
     "colsample_bynode": np.arange(0.1, 1, 0.1)
     }
 
-    ridge_params = {
-        "alpha": np.arange(0, 5, 0.1),
+    lasso_params = {
+        "alpha": np.arange(0.1, 1.5, 0.1),
     }
 
-    if not ridge:
-        optimized_model = RandomizedSearchCV(param_distributions=xgb_params, estimator=xgb.XGBRegressor(**kwargs), scoring='neg_mean_squared_error', verbose=1, random_state=42)
+    if not lasso:
+        optimized_model = RandomizedSearchCV(param_distributions=xgb_params, estimator=xgb.XGBRegressor(**kwargs), scoring='r2', verbose=1, random_state=42)
         optimized_model.fit(X, y)
         print("Best Parameters:", optimized_model.best_params_)
     else: 
-        optimized_model = RandomizedSearchCV(param_distributions=ridge_params, estimator=Ridge(solver='svd'), scoring='neg_mean_squared_error', verbose=1, random_state=42)
+        optimized_model = RandomizedSearchCV(param_distributions=lasso_params, estimator=Lasso(), scoring='r2', verbose=1, random_state=42)
         optimized_model.fit(X, y)
         print("Best Parameters:", optimized_model.best_params_)
     return optimized_model
-
 
 
 def reg_plot(x, y, title, ax=None):
@@ -280,6 +279,7 @@ def reg_plot(x, y, title, ax=None):
     kwargs = {
         "monotone_constraints": f"{tuple(monotone_csts)}"
     }
+
     resid_model = xgb.XGBRegressor(**kwargs)
     resid_model.fit(X_train.loc[:, weighted_features], residuals)
 
