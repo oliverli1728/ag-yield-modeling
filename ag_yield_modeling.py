@@ -6,8 +6,12 @@ from sklearn.model_selection import RandomizedSearchCV
 from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 import numpy as np 
+import datetime as dt
 import xgboost as xgb
 from matplotlib.offsetbox import AnchoredText
+import heapq
+import math 
+from nasspython.nass_api import nass_data
 
 Path = "ag stuff"
 os.chdir(Path)
@@ -20,19 +24,31 @@ https://www.mdpi.com/2072-4292/13/21/4227
 https://glam1.gsfc.nasa.gov/api/doc/db/versions#default-db
 """
 
-def initialize_df(df, cols, week, start_yr, suffix, var):
-    
-
-    temp = df[df["end_code"].eq(week) & (df["short_desc"].eq(var))]
-    temp = temp[temp["location_desc"].isin(cols)]
-    temp = temp[temp["year"].ge(start_yr)]
-    temp.reset_index(inplace=True)
-    temp = temp.pivot_table(index='year', columns='location_desc', values="Value")
+def initialize_df(states, week, start_yr, end_yr, freq, suffix, var):
+    temp = pd.DataFrame(nass_data("B3744D45-DFBE-3B88-AFB1-25CBC8E64550", agg_level_desc="STATE", freq_desc=freq, short_desc=var)['data'])
+    temp = temp[temp["state_name"].isin(states)]
+    if (freq == "WEEKLY"):
+        temp = temp[temp["reference_period_desc"].eq(f"WEEK #{week}")]
+    elif (freq == "ANNUAL"):
+        temp = temp[temp["reference_period_desc"].eq("YEAR")]
+    temp = temp[temp["year"].ge(start_yr) & temp["year"].le(end_yr)]
+    temp = temp.pivot(index='year', columns='state_name', values="Value")
     temp = temp.add_suffix(suffix)
+    temp = temp.replace(",", "", regex=True)
+    temp = temp.fillna(0).astype(float)
     return temp 
 
+
 """
-The model runs one default variable, specified by the overlay_var. This can be "maturity" or "harvested".
+Get crop mask from: https://glam1.gsfc.nasa.gov/api/doc/db/versions#default-db
+"""
+def get_ndvi(version, mask, start_month, num_months, ts_type='seasonal', mcv=None, ids=27258):
+    df = pd.read_csv(f"https://glam1.gsfc.nasa.gov/api/gettbl/v4?sat=MOD&version={version}&layer=NDVI&mask={mask}&shape=ADM&ids={ids}&ts_type={ts_type}&start_month={start_month}&num_months={num_months}&format=csv", skiprows=14).ffill()
+    df = df[df["ORDINAL DATE"].ge("2000-01-01") & df["ORDINAL DATE"].lt("2024-01-01")]
+    return df 
+
+
+"""
 Pass array of 1s and 0s indicating which additional variables to include.
 
 Below are the available variables, in order:
@@ -41,34 +57,40 @@ Below are the available variables, in order:
 3. PCT Change in Excellent (pct @ week - pct @ week - 10)
 4. PCT Change in Good (pct @ week - pct @ week - 10)
 5. Acres planted/year
-6. Drought data for basket of states
+6. Acres harvested at current week
+7. PCT Mature at current week
+8. Drought data
 """
 
 
-def get_data(crop, week, overlay_var, start_yr=2000, end_yr=2023, var_arr=[]):
+def get_data(crop, week, start_yr=2000, end_yr=2023, var_arr=[]):
     
-    df = pd.read_csv("https://glam1.gsfc.nasa.gov/api/gettbl/v4?sat=MOD&version=v15&layer=NDVI&mask=USDA-NASS-CDL_2018-2023_corn-50pp&shape=ADM&ids=110955&ids=110961&ts_type=seasonal&years=2000&years=2001&years=2002&years=2003&years=2004&years=2005&years=2006&years=2007&years=2008&years=2009&years=2010&years=2011&years=2012&years=2013&years=2014&years=2015&years=2016&years=2017&years=2018&years=2019&years=2020&years=2021&years=2022&years=2023&start_month=4&num_months=8&format=csv", skiprows=14).ffill()
+    if (crop == "CORN"):
+        states = ["WISCONSIN", "SOUTH DAKOTA", "OHIO", "NEBRASKA", "MISSOURI", "MINNESOTA", "KANSAS", "IOWA", "INDIANA", "ILLINOIS"]
+        threshold = 0.56
+    elif (crop == "SOYBEANS"):
+        threshold = 0.58
+        states = ["SOUTH DAKOTA", "OHIO", "NORTH DAKOTA", "NEBRASKA", "MISSOURI", "MINNESOTA", "IOWA", "INDIANA", "ILLINOIS", "ARKANSAS"]
+    elif (crop == "WHEAT, WINTER"):
+        threshold = 0.3
+        states = ["WASHINGTON", "SOUTH DAKOTA", "OKLAHOMA", "NEBRASKA", "MONTANA", "MISSOURI", "KANSAS", "ILLINOIS", "IDAHO", "COLORADO"]
+
+
+    df = get_ndvi("v15", "USDA-NASS-CDL_2018-2023_soybean-50pp", 1, 12)
+    
     idx = list()
     for i in range(end_yr - start_yr + 1):
         idx.append(start_yr + i)
     NDVI = list()
 
     # Data taken from USDA Quickstats
+    if (crop == "CORN"):
+        yields = initialize_df(states, None, start_yr, end_yr, "ANNUAL", "", "CORN, GRAIN - YIELD, MEASURED IN BU / ACRE")
+    else:
+        yields = initialize_df(states, None, start_yr, end_yr, "ANNUAL", "", f"{crop} - YIELD, MEASURED IN BU / ACRE")
 
-    dropped_cols = ["Program", "Week Ending", "Ag District", "Ag District Code", "Watershed", "Commodity", "Data Item", "watershed_code", "County", "County ANSI", "Zip Code", "Region", "Domain", "Domain Category", "CV (%)"]
-    yields=pd.read_csv(f"data/annual_{crop}_yields.csv")
-    yields.drop(columns=dropped_cols, inplace=True)
-    yields = yields.iloc[::-1]
-    yields.reset_index(inplace=True, drop=True)
-
-    overlay = pd.read_csv(f"data/{crop}_{overlay_var}_wk{week}.csv")
-    overlay.drop(columns=dropped_cols, inplace=True)
-    overlay = overlay.iloc[::-1]
-    overlay.reset_index(inplace=True, drop=True)
-    overlay = overlay.pivot(index="Year", columns="State", values="Value")
-    overlay = overlay.add_suffix(" MATURITY")
+    overlay = pd.DataFrame()
     
-    progress_hist = pd.read_csv("data/progress_hist.csv")
     additional_vars = {
                     0: f"{crop} - CONDITION, MEASURED IN PCT EXCELLENT",
                     1: f"{crop} - CONDITION, MEASURED IN PCT GOOD",
@@ -76,59 +98,50 @@ def get_data(crop, week, overlay_var, start_yr=2000, end_yr=2023, var_arr=[]):
                     3: f"{crop} - CONDITION, MEASURED IN PCT GOOD",
                     4: "PCT CHNGE EXCELLENT",
                     5: "PCT CHNGE GOOD",
-                    6: "Acres planted/year",
-                    7: "Drought data" 
+                    6: f"{crop} - ACRES PLANTED",
+                    7: f"{crop} - PROGRESS, MEASURED IN PCT HARVESTED",
+                    8: f"{crop} - PROGRESS, MEASURED IN PCT MATURE",
+                    9: "Drought data" 
     }
 
-
-    if (crop == "CORN"):
-        states = pd.DataFrame(columns=["WISCONSIN", "SOUTH DAKOTA", "OHIO", "NEBRASKA", "MISSOURI", "MINNESOTA", "KANSAS", "IOWA", "INDIANA", "ILLINOIS"], index=idx)
-        cols = states.columns
-        threshold = 0.3
-    elif (crop == "SOYBEAN"):
-        threshold = 0.58
-        states = pd.DataFrame(columns=["SOUTH DAKOTA", "OHIO", "NORTH DAKOTA", "NEBRASKA", "MISSOURI", "MINNESOTA", "IOWA", "INDIANA", "ILLINOIS", "ARKANSAS"], index=idx)
-    elif (crop == "WHEAT, WINTER"):
-        threshold = 0.3
-        states = pd.DataFrame(columns=["WASHINGTON", "SOUTH DAKOTA", "OKLAHOMA", "NEBRASKA", "MONTANA", "MISSOURI", "KANSAS", "ILLINOIS", "IDAHO", "COLORADO"], index=idx)
-
-    y = pd.DataFrame(columns=states.columns)
-
-    for i in range(6):
-        if i == 2:
-            excellent_24 = initialize_df(progress_hist, cols, 24, 2000, " EXCELLENT PCT CHNGE", additional_vars[2])
-            excellent_34 = initialize_df(progress_hist, cols, 34, 2000, " EXCELLENT PCT CHNGE", additional_vars[2])
-            pct_chnge_excellent = excellent_34 - excellent_24
-            overlay = pd.concat([overlay, pct_chnge_excellent], axis=1)
-        elif i == 3:
-            good_24 = initialize_df(progress_hist, cols, 24, 2000, " GOOD PCT CHNGE", additional_vars[1])
-            good_34 = initialize_df(progress_hist, cols, 34, 2000, " GOOD PCT CHNGE", additional_vars[1])
-            pct_chnge_good = good_34 - good_24
-            overlay = pd.concat([overlay, pct_chnge_good], axis=1)
-        elif i == 4:
-            planted = pd.read_csv(f"data/annual_{crop}_planted.csv")
-            planted.drop(columns=dropped_cols, inplace=True)
-            planted = planted.iloc[::-1]
-            planted.reset_index(inplace=True, drop=True)
-            planted = planted.pivot(index="Year", columns="State", values="Value")
-            planted = planted.add_suffix(" Planted")
-            overlay = pd.concat([overlay, planted], axis=1)
-        elif i == 5:
-            drought_index = pd.read_excel(f"data/{crop}_Drought.xlsx", index_col=0, parse_dates=True)
-            drought_index = drought_index.loc[:, ["D0", "D1", "D2", "D3", "D4", "None"]].iloc[::-1].reset_index()
-            drought_index['MapDate'] = drought_index['MapDate'].dt.year
-            drought_index = drought_index.groupby("MapDate", as_index=True, sort=False)[["D0", "D1", "D2", "D3", "D4", "None"]].mean()
-            drought_index.index.name = None
-            drought_index.drop(index=2024, inplace=True)
-            overlay = pd.concat([overlay, drought_index], axis=1)
-        elif i == 0:
-            temp = initialize_df(progress_hist, cols, week, start_yr, " EXCELLENT", additional_vars[i])
-            overlay = pd.concat([overlay, temp], axis=1)   
-        else:
-            temp = initialize_df(progress_hist, cols, week, start_yr, " GOOD", additional_vars[i])
-            overlay = pd.concat([overlay, temp], axis=1)
-
-
+    for i in range(8):
+        if var_arr[i] == 1:
+            if i == 2:
+                excellent_24 = initialize_df(states, week - 10, start_yr, end_yr, "WEEKLY", " EXCELLENT PCT CHNGE", additional_vars[i])
+                excellent_34 = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " EXCELLENT PCT CHNGE", additional_vars[i])
+                pct_chnge_excellent = excellent_34 - excellent_24
+                overlay = pd.concat([overlay, pct_chnge_excellent], axis=1)
+            elif i == 3:
+                good_24 = initialize_df(states, week - 10, start_yr, end_yr, "WEEKLY", " GOOD PCT CHNGE", additional_vars[i])
+                good_34 = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " GOOD PCT CHNGE", additional_vars[i])
+                pct_chnge_good = good_34 - good_24
+                overlay = pd.concat([overlay, pct_chnge_good], axis=1)
+            elif i == 4:
+                planted = initialize_df(states, None, start_yr, end_yr, "ANNUAL", " ACRES PLANTED", additional_vars[6])
+                overlay = pd.concat([overlay, planted], axis=1)
+            elif i == 5:
+                if (crop == "CORN"):
+                    harvested = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " ACRES HARVESTED", "CORN, GRAIN - PROGRESS, MEASURED IN PCT HARVESTED")
+                else:
+                    harvested = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " ACRES HARVESTED", additional_vars[7])
+                overlay = pd.concat([overlay, harvested], axis=1)
+            elif i == 6:
+                maturity = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " PCT MATURE", additional_vars[8])
+                overlay = pd.concat([overlay, maturity], axis=1)
+            elif i == 7:
+                drought_index = pd.read_csv(f"data/{crop}_Drought.csv", index_col=0, parse_dates=True)
+                drought_index = drought_index.loc[:, ["D0", "D1", "D2", "D3", "D4", "None"]].iloc[::-1].reset_index()
+                drought_index['MapDate'] = drought_index['MapDate'].dt.year
+                drought_index = drought_index.groupby("MapDate", as_index=True, sort=False)[["D0", "D1", "D2", "D3", "D4", "None"]].mean()
+                drought_index.index.name = None
+                drought_index.drop(index=2024, inplace=True)
+                overlay = pd.concat([overlay, drought_index], axis=1)
+            elif i == 0:
+                temp = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " PCT EXCELLENT", additional_vars[i])
+                overlay = pd.concat([overlay, temp], axis=1)   
+            elif i == 1:
+                temp = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " PCT GOOD", additional_vars[i])
+                overlay = pd.concat([overlay, temp], axis=1)
 
     count=0
     for i in range(df.shape[0]):
@@ -138,17 +151,12 @@ def get_data(crop, week, overlay_var, start_yr=2000, end_yr=2023, var_arr=[]):
         elif (df.loc[i, "SAMPLE VALUE"] >= threshold): 
             count+=df.loc[i, "SAMPLE VALUE"]   
     
-    for i in y.columns:
-        y[i] = yields[yields["State"] == i]["Value"].values
-    
     x = pd.concat([pd.DataFrame(NDVI, columns=["NDVI"], index=idx), overlay], axis=1)
-    return y, x
+    return yields, x
 
-# Takes "corn", "soybean", "winter_wheat". Harvest weeks are 34/35/36, 43, and 31 respectively. 
-# Overlays variable, either "harvested" or "maturity"
-y, x = get_data("CORN", 34, "maturity", 2000, 2023, [1, 1, 1, 1, 1, 1])
-
-
+# Takes "CORN" or "WHEAT, WINTER". Harvest weeks are 34/35/36 and 31, respectively. 
+# Overlay variable, either "harvested" or "maturity"
+y, x = get_data("SOYBEANS", 43, 2000, 2023, [1, 1, 1, 1, 1, 1, 1, 1])
 
 vhi_links = ["https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=14&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
              "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=15&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
@@ -161,8 +169,7 @@ vhi_links = ["https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?
              "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=42&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
              "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=50&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024"]
 
-
-# Extra VHI data
+# Extra VHI data (just call the function if you want it)
 def get_vhi_data(links):
     for i in range(len(links)):
         global x 
@@ -179,7 +186,6 @@ def get_vhi_data(links):
         vhi.index = x.index 
         x = pd.concat([x, vhi], axis=1)
 
-
 x.fillna(0, inplace=True)
 cols = x.columns
 scaler = MinMaxScaler()
@@ -190,17 +196,26 @@ x = pd.DataFrame(x, columns=cols)
 fig, axs = plt.subplots(5, 2)
 
 
-def feature_importance(model, df, ax):
+def feature_importance(model, df, ax, num_features, plot=False, print_results=False):
         importance = model.coef_
         keys = list(df.keys())
+        abs_weights = {}
+        weights = {}
         for i,v in enumerate(importance):
-            print("Feature: %s, Score: %.5f" % (keys[i],v))
+            if print_results:
+                print("Feature: %s, Score: %.5f" % (keys[i],v))
+            abs_weights[keys[i]] = abs(v)
+            weights[keys[i]] = v
+        if plot:
+            ax.bar([x for x in range(len(importance))], height=importance, color='b')
+            tickvals = range(0, len(importance))
+            cols = df.columns
+            ax.set_xticks(ticks=tickvals, labels=cols, rotation=45, fontsize='xx-small', fontstretch='extra-condensed')
+        
+        largest_features = heapq.nlargest(num_features, abs_weights, key=abs_weights.get)
 
-        ax.bar([x for x in range(len(importance))], height=importance, color='b')
-        tickvals = range(0, len(importance))
-        cols = df.columns
-        ax.set_xticks(ticks=tickvals, labels=cols, rotation=45, fontsize='xx-small', fontstretch='extra-condensed')
-        return importance
+        avg_abs_weight = sum([abs_weights.get(key) for key in largest_features]) / len(largest_features)
+        return largest_features, weights, avg_abs_weight
 
 
 """
@@ -208,13 +223,13 @@ Hybrid model of ridge on training data and gradient boosted regressor on residua
 Will need to change params/models if using different framework.
 """
 
-def get_best_model(X, y, xgb=True):
+def get_best_model(X, y, kwargs=None, ridge=True):
     xgb_params = {
-    "learning_rate": np.arange(0.001, 0.2, 0.01),
-    "gamma": range(0, 8),
+    "learning_rate": np.arange(0.01, 0.2, 0.01),
+    "gamma": np.arange(1, 5, 0.2),
     "n_estimators": range(800, 1200),
     "max_depth": range(1, 12),
-    "reg_lambda": np.arange(0.1, 10, 0.1),
+    "reg_lambda": np.arange(0.1, 5),
     "colsample_bynode": np.arange(0.1, 1, 0.1)
     }
 
@@ -222,8 +237,8 @@ def get_best_model(X, y, xgb=True):
         "alpha": np.arange(0, 5, 0.1),
     }
 
-    if xgb:
-        optimized_model = RandomizedSearchCV(param_distributions=xgb_params, estimator=xgb.XGBRegressor(), scoring='neg_mean_squared_error', verbose=1, random_state=42)
+    if not ridge:
+        optimized_model = RandomizedSearchCV(param_distributions=xgb_params, estimator=xgb.XGBRegressor(**kwargs), scoring='neg_mean_squared_error', verbose=1, random_state=42)
         optimized_model.fit(X, y)
         print("Best Parameters:", optimized_model.best_params_)
     else: 
@@ -243,26 +258,34 @@ def reg_plot(x, y, title, ax=None):
     y_cv = y.iloc[20:]
 
 
-    model = Ridge(solver="svd", alpha=1.3)
+    model = get_best_model(X_train, y_train).best_estimator_
     model.fit(X_train, y_train)
     y_train_pred = model.predict(X_train)
     y_test_pred = model.predict(X_test)
 
-    # feature_importance(model, X_train, ax)
+    weighted_features, weights, avg_abs_weight = feature_importance(model, X_train, ax, math.ceil(X_train.shape[1]/2), print_results=True)
 
     residuals = y_train - y_train_pred[0]
     residuals = pd.DataFrame(residuals, index=y_train.index)
 
-    kwargs = {
-        "monotone_constraints": "(1, 1, 1, -1, 1, 1)"
-    }
+    monotone_csts = np.zeros(len(weighted_features))
+    monotone_csts = np.array(monotone_csts, dtype=int)
+    for i in range(len(weighted_features)):
 
+        if weights[weighted_features[i]] < 0 and abs(weights[weighted_features[i]]) < avg_abs_weight:
+            monotone_csts[i] = -1
+        elif weights[weighted_features[i]] > 0 and weights[weighted_features[i]] > avg_abs_weight:
+            monotone_csts[i] = 1
+
+    kwargs = {
+        "monotone_constraints": f"{tuple(monotone_csts)}"
+    }
     resid_model = xgb.XGBRegressor(**kwargs)
-    resid_model.fit(X_train.loc[:, ["NDVI", col_name + " GOOD PCT CHNGE", col_name + " EXCELLENT PCT CHNGE", col_name + " MATURITY", col_name + " EXCELLENT", col_name + " GOOD"]], residuals)
+    resid_model.fit(X_train.loc[:, weighted_features], residuals)
 
     ax.scatter(y_train.index, y_train)
     ax.plot(y_train.index, y_train_pred)
-    pred2 = resid_model.predict(X_test.loc[:, ["NDVI", col_name + " GOOD PCT CHNGE", col_name + " EXCELLENT PCT CHNGE", col_name + " MATURITY", col_name + " EXCELLENT", col_name + " GOOD"]]) + y_test_pred
+    pred2 = resid_model.predict(X_test.loc[:, weighted_features]) + y_test_pred
     pred2 = pd.DataFrame(pred2, index=y_test.index)
     ax.scatter(y_test.index, y_test)
     ax.plot(y_test.index, pred2)
@@ -271,8 +294,8 @@ def reg_plot(x, y, title, ax=None):
     resid_cv = pd.DataFrame(resid_cv, index=y_test.index)
 
     resid_cv_model = xgb.XGBRegressor(**kwargs)
-    resid_cv_model.fit(X_test.loc[:, ["NDVI", col_name + " GOOD PCT CHNGE", col_name + " EXCELLENT PCT CHNGE", col_name + " MATURITY", col_name + " EXCELLENT", col_name + " GOOD"]], resid_cv)
-    resid_cv_pred = resid_cv_model.predict(X_cv.loc[:, ["NDVI", col_name + " GOOD PCT CHNGE", col_name + " EXCELLENT PCT CHNGE", col_name + " MATURITY", col_name + " EXCELLENT", col_name + " GOOD"]])
+    resid_cv_model.fit(X_test.loc[:, weighted_features], resid_cv)
+    resid_cv_pred = resid_cv_model.predict(X_cv.loc[:, weighted_features])
     pred3 = model.predict(X_cv)
 
     pred3 = resid_cv_pred + pred3
@@ -292,16 +315,16 @@ def reg_plot(x, y, title, ax=None):
     at.patch.set_boxstyle("square, pad=0.0")
     ax.add_artist(at)
 
-
     return ax 
 
 for i, ax in enumerate(fig.axes):
     col_name = y.columns[i]
     state_data = x.filter(regex=col_name)
     ndvi_data = x.loc[:, "NDVI"]
-    drought_data = x.loc[:, ["D1", "D2", "D3", "D4"]]
     input = pd.concat([ndvi_data, state_data], axis=1, ignore_index=False)
-    input = pd.concat([input, drought_data], axis=1, ignore_index=False)
+    if "D1" in x.columns:
+        drought_data = x.loc[:, ["D1", "D2", "D3", "D4"]]
+        input = pd.concat([input, drought_data], axis=1, ignore_index=False)
 
     reg_plot(input, y.iloc[:, i], col_name, ax)
 
