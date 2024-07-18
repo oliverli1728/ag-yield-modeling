@@ -234,15 +234,15 @@ def get_best_model(X, y, kwargs=None, lasso=True):
     }
 
     lasso_params = {
-        "alpha": np.arange(0.1, 1.5, 0.1),
+        "alpha": np.arange(0.1, 0.7, 0.05),
     }
 
     if not lasso:
-        optimized_model = RandomizedSearchCV(param_distributions=xgb_params, estimator=xgb.XGBRegressor(**kwargs), scoring='r2', verbose=1, random_state=42)
+        optimized_model = RandomizedSearchCV(param_distributions=xgb_params, estimator=xgb.XGBRegressor(**kwargs), scoring='neg_mean_absolute_error', verbose=1, random_state=42, cv=2)
         optimized_model.fit(X, y)
         print("Best Parameters:", optimized_model.best_params_)
     else: 
-        optimized_model = RandomizedSearchCV(param_distributions=lasso_params, estimator=Lasso(), scoring='r2', verbose=1, random_state=42)
+        optimized_model = RandomizedSearchCV(param_distributions=lasso_params, estimator=Lasso(), scoring='neg_mean_absolute_error', verbose=1, random_state=42)
         optimized_model.fit(X, y)
         print("Best Parameters:", optimized_model.best_params_)
     return optimized_model
@@ -257,14 +257,14 @@ def reg_plot(x, y, title, ax=None):
     y_cv = y.iloc[20:]
 
 
-    model = get_best_model(X_train, y_train).best_estimator_
+    model = Lasso(0.45)
     model.fit(X_train, y_train)
     y_train_pred = model.predict(X_train)
     y_test_pred = model.predict(X_test)
 
     weighted_features, weights, avg_abs_weight = feature_importance(model, X_train, ax, math.ceil(X_train.shape[1]/2), print_results=True)
 
-    residuals = y_train - y_train_pred[0]
+    residuals = y_train - y_train_pred
     residuals = pd.DataFrame(residuals, index=y_train.index)
 
     monotone_csts = np.zeros(len(weighted_features))
