@@ -272,7 +272,7 @@ def reg_plot(x, y, title, ax=None):
     monotone_csts = np.array(monotone_csts, dtype=int)
     for i in range(len(weighted_features)):
 
-        if weights[weighted_features[i]] < 0 and abs(weights[weighted_features[i]]) < avg_abs_weight:
+        if weights[weighted_features[i]] < 0 and abs(weights[weighted_features[i]]) > avg_abs_weight:
             monotone_csts[i] = -1
         elif weights[weighted_features[i]] > 0 and weights[weighted_features[i]] > avg_abs_weight:
             monotone_csts[i] = 1
