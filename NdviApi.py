@@ -23,7 +23,7 @@ class NDVI(object):
     All parameters:
         version: This is the version of the database to use. "v15" is the most recent one
 
-        sat: "MOD", "MYD" or "VNP"
+        sat: Type of satellite. "MOD", "MYD" or "VNP"
 
         shape: The shape of the vector you want, can either be ADM or LIS. 
 
