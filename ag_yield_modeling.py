@@ -1,20 +1,23 @@
 import os
 import pandas as pd
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import Lasso, Ridge, ElasticNet
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import RandomizedSearchCV
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_absolute_error
 import matplotlib.pyplot as plt
 import numpy as np 
-import datetime as dt
 import xgboost as xgb
 from matplotlib.offsetbox import AnchoredText
+import datetime as dt
 import heapq
 import math 
 from nasspython.nass_api import nass_data
+from NdviApi import NDVI
 
 Path = "ag stuff"
 os.chdir(Path)
+
+plt.style.use('ggplot')
 
 """ 
 Helpful Links:
@@ -39,15 +42,50 @@ def initialize_df(states, week, start_yr, end_yr, freq, suffix, var):
     return temp 
 
 
-"""
-Get crop mask from: https://glam1.gsfc.nasa.gov/api/doc/db/versions#default-db
-"""
-def get_ndvi(version, mask, start_month, num_months, ts_type='seasonal', mcv=None, ids=27258):
-    df = pd.read_csv(f"https://glam1.gsfc.nasa.gov/api/gettbl/v4?sat=MOD&version={version}&layer=NDVI&mask={mask}&shape=ADM&ids={ids}&ts_type={ts_type}&start_month={start_month}&num_months={num_months}&format=csv", skiprows=14).ffill()
-    df = df[df["ORDINAL DATE"].ge("2000-01-01") & df["ORDINAL DATE"].lt("2024-01-01")]
-    return df 
+def get_ndvi_data(states, ids, mask, threshold, index):
+    acc_ndvi_df = pd.DataFrame(index=index)
+    for i in range(len(ids)):
+        acc_ndvi = list()
+        df = NDVI().get_data(
+                            version='v15', 
+                            sat='MOD',
+                            mask=mask, 
+                            shape='ADM',
+                            start_yr=2000,
+                            end_yr=2023,
+                            start_month=1,
+                            num_months=12,
+                            ids=ids[i],
+                            ts_type='cumulative',
+                            mcv=0.0
+                            )
+        count=0
+        for j in range(df.shape[0]):
+            if (int(df.loc[j, "ORDINAL DATE"][-3:]) == 329):
+                acc_ndvi.append(count)
+                count=0
+            elif (df.loc[j, "SAMPLE VALUE"] >= threshold): 
+                count+=df.loc[j, "SAMPLE VALUE"] 
+        acc_ndvi_df["NDVI " + states[i]] = acc_ndvi  
+    return acc_ndvi_df
 
-
+def get_drought_data(states, ids, start_yr, end_yr, index):
+    drought_data = pd.DataFrame(index=index)
+    for i in range (len(ids)):
+        if len(str(ids[i])) == 1:
+            df = pd.read_json(f"https://usdmdataservices.unl.edu/api/StateStatistics/GetDroughtSeverityStatisticsByArea?aoi=0{ids[i]}&startdate=1/1/{start_yr}&enddate=1/1/{end_yr+1}&statisticsType=1")
+        else:
+            df = pd.read_json(f"https://usdmdataservices.unl.edu/api/StateStatistics/GetDroughtSeverityStatisticsByArea?aoi={ids[i]}&startdate=1/1/{start_yr}&enddate=1/1/{end_yr+1}&statisticsType=1")
+        df = df.loc[:, ["ValidStart", "None", "D0", "D1", "D2", "D3", "D4"]]
+        df["ValidStart"] = pd.to_datetime(df["ValidStart"]).dt.to_period('Y')
+        df = df.iloc[::-1].set_index("ValidStart", drop=True)
+        df = df.replace(",", "", regex=True)
+        df = df.fillna(0).astype(float)
+        df = df.groupby(lambda x: x.year)[["None", "D0", "D1", "D2", "D3", "D4"]].mean()
+        df.index.name = None
+        df = df.add_prefix(f"{states[i]} ")
+        drought_data = pd.concat([drought_data, df], axis=1)
+    return drought_data
 """
 Pass array of 1s and 0s indicating which additional variables to include.
 
@@ -67,23 +105,26 @@ def get_data(crop, week, start_yr=2000, end_yr=2023, var_arr=[]):
     
     if (crop == "CORN"):
         states = ["WISCONSIN", "SOUTH DAKOTA", "OHIO", "NEBRASKA", "MISSOURI", "MINNESOTA", "KANSAS", "IOWA", "INDIANA", "ILLINOIS"]
-        threshold = 0.56
-    elif (crop == "SOYBEANS"):
+        ndvi_ids = [26264, 26237, 26258, 26228, 26253, 26251, 26226, 26246, 26245, 26244]
+        drought_ids = [55, 46, 39, 31, 29, 27, 20, 19, 18, 17]
         threshold = 0.58
+    elif (crop == "SOYBEANS"):
         states = ["SOUTH DAKOTA", "OHIO", "NORTH DAKOTA", "NEBRASKA", "MISSOURI", "MINNESOTA", "IOWA", "INDIANA", "ILLINOIS", "ARKANSAS"]
+        ndvi_ids = [26237, 26258, 26236, 26228, 26253, 26251, 26246, 26245, 26244, 26240]
+        drought_ids = [46, 39, 38, 31, 29, 27, 19, 18, 17, 5]
+        threshold = 0.58
     elif (crop == "WHEAT, WINTER"):
-        threshold = 0.3
         states = ["WASHINGTON", "SOUTH DAKOTA", "OKLAHOMA", "NEBRASKA", "MONTANA", "MISSOURI", "KANSAS", "ILLINOIS", "IDAHO", "COLORADO"]
+        ndvi_ids = [26234, 26237, 26230, 26228, 26227, 26253, 26226, 26244, 26225, 26224]
+        drought_ids = [53, 46, 40, 31, 30, 29, 20, 17, 16, 8]
+        threshold = 0.34
 
-
-    df = get_ndvi("v15", "USDA-NASS-CDL_2018-2023_corn-50pp", 1, 12)
+    idx = list(range(start_yr, end_yr + 1))
+    """
+    Get crop mask from: https://glam1.gsfc.nasa.gov/api/doc/db/versions#default-db
+    """
+    df = get_ndvi_data(states, ndvi_ids, mask="USDA-NASS-CDL_2018-2023_winterwheat-50pp", threshold=threshold, index=idx)
     
-    idx = list()
-    for i in range(end_yr - start_yr + 1):
-        idx.append(start_yr + i)
-    NDVI = list()
-
-    # Data taken from USDA Quickstats
     if (crop == "CORN"):
         yields = initialize_df(states, None, start_yr, end_yr, "ANNUAL", "", "CORN, GRAIN - YIELD, MEASURED IN BU / ACRE")
     else:
@@ -129,12 +170,7 @@ def get_data(crop, week, start_yr=2000, end_yr=2023, var_arr=[]):
                 maturity = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " PCT MATURE", additional_vars[8])
                 overlay = pd.concat([overlay, maturity], axis=1)
             elif i == 7:
-                drought_index = pd.read_csv(f"data/{crop}_Drought.csv", index_col=0, parse_dates=True)
-                drought_index = drought_index.loc[:, ["D0", "D1", "D2", "D3", "D4", "None"]].iloc[::-1].reset_index()
-                drought_index['MapDate'] = drought_index['MapDate'].dt.year
-                drought_index = drought_index.groupby("MapDate", as_index=True, sort=False)[["D0", "D1", "D2", "D3", "D4", "None"]].mean()
-                drought_index.index.name = None
-                drought_index.drop(index=2024, inplace=True)
+                drought_index = get_drought_data(states, drought_ids, 2000, 2023, idx)
                 overlay = pd.concat([overlay, drought_index], axis=1)
             elif i == 0:
                 temp = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " PCT EXCELLENT", additional_vars[i])
@@ -143,20 +179,11 @@ def get_data(crop, week, start_yr=2000, end_yr=2023, var_arr=[]):
                 temp = initialize_df(states, week, start_yr, end_yr, "WEEKLY", " PCT GOOD", additional_vars[i])
                 overlay = pd.concat([overlay, temp], axis=1)
 
-    count=0
-    for i in range(df.shape[0]):
-        if (int(df.loc[i, "ORDINAL DATE"][-3:]) == 329):
-            NDVI.append(count)
-            count=0
-        elif (df.loc[i, "SAMPLE VALUE"] >= threshold): 
-            count+=df.loc[i, "SAMPLE VALUE"]   
     
-    x = pd.concat([pd.DataFrame(NDVI, columns=["NDVI"], index=idx), overlay], axis=1)
+    x = pd.concat([df, overlay], axis=1)
     return yields, x
 
-# Takes "CORN" or "WHEAT, WINTER". Harvest weeks are 34/35/36 and 31, respectively. 
-# Overlay variable, either "harvested" or "maturity"
-y, x = get_data("CORN", 31, 2000, 2023, [1, 1, 1, 1, 1, 1, 1, 1])
+y, x = get_data("WHEAT, WINTER", 31, 2000, 2023, [1, 1, 1, 1, 1, 1, 1, 1])
 
 vhi_links = ["https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=14&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
              "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=15&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
@@ -169,7 +196,7 @@ vhi_links = ["https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?
              "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=42&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024",
              "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/get_TS_admin.php?provinceID=50&country=USA&yearlyTag=Yearly&type=Parea_VHI&TagCropland=MAIZ&year1=1982&year2=2024"]
 
-# Extra VHI data (just call the function if you want it)
+# Extra VHI data for corn (just call the function if you want it)
 def get_vhi_data(links):
     for i in range(len(links)):
         global x 
@@ -192,9 +219,7 @@ scaler = MinMaxScaler()
 x = scaler.fit_transform(x)
 x = pd.DataFrame(x, columns=cols)
 
-
 fig, axs = plt.subplots(5, 2)
-
 
 def feature_importance(model, df, ax, num_features, plot=False, print_results=False):
         importance = model.coef_
@@ -219,22 +244,22 @@ def feature_importance(model, df, ax, num_features, plot=False, print_results=Fa
 
 
 """
-Hybrid model of ridge on training data and gradient boosted regressor on residuals
+Hybrid model of lasso on training data and gradient boosted regressor on residuals
 Will need to change params/models if using different framework.
 """
 
 def get_best_model(X, y, kwargs=None, lasso=True):
     xgb_params = {
     "learning_rate": np.arange(0.01, 0.2, 0.01),
-    "gamma": np.arange(1, 5, 0.2),
+    "min_child_weight": np.arange(1, 5, 1),
     "n_estimators": range(800, 1200),
-    "max_depth": range(1, 12),
-    "reg_lambda": np.arange(0.1, 5),
-    "colsample_bynode": np.arange(0.1, 1, 0.1)
+    "max_depth": range(1, 5),
+    "colsample_bytree": np.arange(0.1, 1, 0.1),
+    "subsample": np.arange(0.1, 1, 0.1)
     }
 
     lasso_params = {
-        "alpha": np.arange(0.1, 0.7, 0.05),
+        "alpha": np.arange(0.05, 2, 0.05),
     }
 
     if not lasso:
@@ -242,7 +267,7 @@ def get_best_model(X, y, kwargs=None, lasso=True):
         optimized_model.fit(X, y)
         print("Best Parameters:", optimized_model.best_params_)
     else: 
-        optimized_model = RandomizedSearchCV(param_distributions=lasso_params, estimator=Lasso(), scoring='neg_mean_absolute_error', verbose=1, random_state=42)
+        optimized_model = RandomizedSearchCV(param_distributions=lasso_params, estimator=Lasso(random_state=42), scoring='neg_mean_absolute_error', verbose=1, random_state=42)
         optimized_model.fit(X, y)
         print("Best Parameters:", optimized_model.best_params_)
     return optimized_model
@@ -257,7 +282,7 @@ def reg_plot(x, y, title, ax=None):
     y_cv = y.iloc[20:]
 
 
-    model = Lasso(0.45)
+    model = get_best_model(X_train, y_train).best_estimator_
     model.fit(X_train, y_train)
     y_train_pred = model.predict(X_train)
     y_test_pred = model.predict(X_test)
@@ -280,7 +305,11 @@ def reg_plot(x, y, title, ax=None):
         "monotone_constraints": f"{tuple(monotone_csts)}"
     }
 
-    resid_model = xgb.XGBRegressor(**kwargs)
+    resid_model = xgb.XGBRegressor(
+                                   max_depth=4,
+                                   colsample_bytree=0.5,
+                                   min_child_weight=2,
+                                   **kwargs)
     resid_model.fit(X_train.loc[:, weighted_features], residuals)
 
     ax.scatter(y_train.index, y_train)
@@ -293,7 +322,11 @@ def reg_plot(x, y, title, ax=None):
     resid_cv = y_test - y_test_pred
     resid_cv = pd.DataFrame(resid_cv, index=y_test.index)
 
-    resid_cv_model = xgb.XGBRegressor(**kwargs)
+    resid_cv_model = xgb.XGBRegressor(
+                                   max_depth=4,
+                                   colsample_bytree=0.5,
+                                   min_child_weight=2,
+                                   **kwargs)
     resid_cv_model.fit(X_test.loc[:, weighted_features], resid_cv)
     resid_cv_pred = resid_cv_model.predict(X_cv.loc[:, weighted_features])
     pred3 = model.predict(X_cv)
@@ -305,7 +338,7 @@ def reg_plot(x, y, title, ax=None):
 
     ax.set_title(title)
 
-    s = np.sqrt(mean_squared_error(y_cv, pred3))
+    s = mean_absolute_error(y_cv, pred3)
     at = AnchoredText(
         f"{s:.2f}",
         prop=dict(size="large"),
@@ -320,8 +353,7 @@ def reg_plot(x, y, title, ax=None):
 for i, ax in enumerate(fig.axes):
     col_name = y.columns[i]
     state_data = x.filter(regex=col_name)
-    ndvi_data = x.loc[:, "NDVI"]
-    input = pd.concat([ndvi_data, state_data], axis=1, ignore_index=False)
+    input = state_data
     if "D1" in x.columns:
         drought_data = x.loc[:, ["D1", "D2", "D3", "D4"]]
         input = pd.concat([input, drought_data], axis=1, ignore_index=False)
